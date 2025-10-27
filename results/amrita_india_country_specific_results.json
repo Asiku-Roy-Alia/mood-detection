@@ -1,0 +1,23 @@
+{
+  "site":"Amrita (India)",
+  "model":"rf",
+  "folds":3,
+  "repeats":5,
+  "tolerance_minutes":60,
+  "plm_bin":{
+    "mean":0.6243179097,
+    "std":0.089576391
+  },
+  "hm_bin":{
+    "mean":0.7637598131,
+    "std":0.111266036
+  },
+  "plm_three":{
+    "mean":0.6243287853,
+    "std":0.0809279908
+  },
+  "hm_three":{
+    "mean":0.7581107768,
+    "std":0.103422077
+  }
+}

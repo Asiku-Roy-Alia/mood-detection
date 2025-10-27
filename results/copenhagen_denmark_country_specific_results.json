@@ -1,0 +1,23 @@
+{
+  "site":"Copenhagen (Denmark)",
+  "model":"rf",
+  "folds":3,
+  "repeats":5,
+  "tolerance_minutes":60,
+  "plm_bin":{
+    "mean":0.4960010581,
+    "std":0.0750427418
+  },
+  "hm_bin":{
+    "mean":0.7860668586,
+    "std":0.0805573605
+  },
+  "plm_three":{
+    "mean":0.4997779298,
+    "std":0.0755146679
+  },
+  "hm_three":{
+    "mean":0.7668366108,
+    "std":0.0691240811
+  }
+}

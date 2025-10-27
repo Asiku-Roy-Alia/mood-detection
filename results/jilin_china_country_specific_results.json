@@ -1,0 +1,23 @@
+{
+  "site":"Jilin (China)",
+  "model":"rf",
+  "folds":3,
+  "repeats":5,
+  "tolerance_minutes":60,
+  "plm_bin":{
+    "mean":0.5598403041,
+    "std":0.0577520983
+  },
+  "hm_bin":{
+    "mean":0.7768789998,
+    "std":0.0383320542
+  },
+  "plm_three":{
+    "mean":0.5503774271,
+    "std":0.0449553924
+  },
+  "hm_three":{
+    "mean":0.7311594854,
+    "std":0.0315356063
+  }
+}

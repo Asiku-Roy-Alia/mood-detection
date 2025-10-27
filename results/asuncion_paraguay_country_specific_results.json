@@ -1,0 +1,23 @@
+{
+  "site":"Asuncion (Paraguay)",
+  "model":"rf",
+  "folds":3,
+  "repeats":5,
+  "tolerance_minutes":60,
+  "plm_bin":{
+    "mean":0.5841350427,
+    "std":0.1260031456
+  },
+  "hm_bin":{
+    "mean":0.7897772207,
+    "std":0.0881038867
+  },
+  "plm_three":{
+    "mean":0.5629896777,
+    "std":0.084710234
+  },
+  "hm_three":{
+    "mean":0.7714839838,
+    "std":0.0686183737
+  }
+}

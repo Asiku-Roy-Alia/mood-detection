@@ -1,0 +1,23 @@
+{
+  "site":"Mak (Uganda)",
+  "model":"rf",
+  "folds":3,
+  "repeats":5,
+  "tolerance_minutes":60,
+  "plm_bin":{
+    "mean":0.5164923364,
+    "std":0.0354033226
+  },
+  "hm_bin":{
+    "mean":0.6455663262,
+    "std":0.0234142686
+  },
+  "plm_three":{
+    "mean":0.5066865838,
+    "std":0.0351740916
+  },
+  "hm_three":{
+    "mean":0.6308008606,
+    "std":0.0276721045
+  }
+}
