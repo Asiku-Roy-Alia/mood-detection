@@ -1,7 +1,6 @@
 # experiment_transfer_country_agnostic_II.py
 # Country-Agnostic II: Train on pooled foreign countries (ALL - UG), test on UG.
-# PLM (pure transfer) and HM (few-shot personalization) AUROC for Binary & Three-class.
-# Fix: deterministic, disjoint UG fold builder that guarantees ≥2 classes per fold.
+# Parallel version: uses half of available CPUs; parallelizes site loading and per-fold-per-repeat evals.
 
 import os
 import math
@@ -9,6 +8,27 @@ import json
 from typing import Optional, List, Tuple, Iterable, Dict
 import numpy as np
 import pandas as pd
+
+# ------------------ CPU / Parallel config  ------------------
+
+def _half_cpus() -> int:
+    try:
+        n = os.cpu_count() or 1
+    except Exception:
+        n = 1
+    return max(1, n // 2)
+
+# Fix outer parallelism workers
+N_WORKERS = _half_cpus()
+
+# Prevent BLAS/OpenMP oversubscription; keep 1 thread inside each worker
+for _ev in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"]:
+    # only set if not explicitly preset by caller
+    os.environ.setdefault(_ev, "1")
+
+# ---------------------------------------------------------------------------------------
+
+from joblib import Parallel, delayed
 
 from sklearn.impute import KNNImputer
 from sklearn.preprocessing import StandardScaler
@@ -131,15 +151,25 @@ def load_and_align_site(site: str, country: str, continent: str,
     df["userid"] = (df["site"].astype(str) + ":" + df["userid"].astype(str)).astype(str)
     return df
 
+# Wrapper for joblib parallel site load
+def _load_site_entry(entry: Dict, tolerance_minutes: int) -> pd.DataFrame:
+    return load_and_align_site(
+        entry["site"], entry["country"], entry["continent"],
+        entry["features"], entry["timediaries"],
+        tolerance_minutes
+    )
+
 # ------------------------ models & helpers ------------------------
 
 def make_rf_pipeline(k_impute=5):
+    # n_jobs=1 to avoid nested parallelism; we parallelize at task level
     return Pipeline([
         ("impute", KNNImputer(n_neighbors=k_impute)),
-        ("clf", RandomForestClassifier(n_estimators=100, random_state=42, class_weight="balanced"))
+        ("clf", RandomForestClassifier(n_estimators=100, random_state=42, class_weight="balanced", n_jobs=1))
     ])
 
 def make_svc_pipeline(k_impute=5):
+    # SVC has no n_jobs; BLAS threads already constrained by env vars above
     return Pipeline([
         ("impute", KNNImputer(n_neighbors=k_impute)),
         ("scale", StandardScaler(with_mean=True)),
@@ -147,10 +177,6 @@ def make_svc_pipeline(k_impute=5):
     ])
 
 def ensure_proba_columns(y_score: np.ndarray, trained_classes: np.ndarray, full_labels: List[int]) -> np.ndarray:
-    """
-    Re-map predict_proba outputs to fixed column order (full_labels).
-    If a class is absent in training, fill its column with zeros; renormalize if needed.
-    """
     trained_classes = np.asarray(trained_classes).astype(int)
     idx_map = {c:i for i,c in enumerate(trained_classes)}
     out = np.zeros((y_score.shape[0], len(full_labels)), dtype=float)
@@ -180,35 +206,22 @@ def build_disjoint_folds_with_constraints(
     test_min_classes: int,
     classes_all: Iterable[int]
 ) -> List[np.ndarray]:
-    """
-    Deterministic, disjoint fold builder:
-    1) Identify 'carrier' users for each class (users with >0 count for that class).
-    2) Greedily assign carriers of minority classes round-robin to folds to ensure coverage.
-    3) Fill remaining users to balance fold sizes.
-    Guarantees: each fold has at least 'test_min_classes' distinct classes.
-    """
     users = prof_ug["user"].tolist()
     class_cols = [c for c in prof_ug.columns if isinstance(c, (int, np.integer))]
-    # Sort classes by global rarity (ascending)
     class_totals = prof_ug[class_cols].sum(axis=0).sort_values().index.tolist()
-    # Map fold -> set(users), class coverage
     fold_users = [set() for _ in range(folds)]
     fold_cov   = [set() for _ in range(folds)]
     target_fold_size = int(round(len(users) / folds))
-
-    # 1) assign carriers of rarer classes first, round-robin
     assigned = set()
+
+    # assign carriers of rarer classes first, round-robin
     for cls in class_totals:
         carriers = prof_ug.loc[prof_ug[cls] > 0, "user"].tolist()
-        # De-duplicate already assigned
         carriers = [u for u in carriers if u not in assigned]
-        # Sort carriers by how many classes they cover (prefer multi-class early)
         multicover = prof_ug.set_index("user").loc[carriers, class_cols].gt(0).sum(axis=1)
         carriers = [u for u,_ in sorted(zip(carriers, multicover), key=lambda t: (-t[1], str(t[0])))]
         f = 0
         for u in carriers:
-            # choose the fold with least coverage of this class and under size
-            # start from f to keep round-robin flavor
             best = None
             for off in range(folds):
                 k = (f + off) % folds
@@ -217,7 +230,6 @@ def build_disjoint_folds_with_constraints(
                 best = k
                 break
             if best is None:
-                # all full; drop to the fold with minimum size
                 sizes = [len(s) for s in fold_users]
                 best = int(np.argmin(sizes))
             fold_users[best].add(u)
@@ -226,70 +238,140 @@ def build_disjoint_folds_with_constraints(
             assigned.add(u)
             f = (best + 1) % folds
 
-    # 2) fill remaining users to balance sizes while preserving min-class constraint
     remaining = [u for u in users if u not in assigned]
-    # Fill by sending each remaining user to the smallest fold so far
     for u in remaining:
-        # pick fold with smallest size; if tie, pick the one that increases class diversity
         sizes = np.array([len(s) for s in fold_users])
         candidates = np.where(sizes == sizes.min())[0].tolist()
-        # prefer a fold that improves coverage towards test_min_classes
         u_cov = {c for c in class_cols if prof_ug.loc[prof_ug["user"]==u, c].values[0] > 0}
         gains = [len((fold_cov[k] | u_cov)) - len(fold_cov[k]) for k in candidates]
         best = candidates[int(np.argmax(gains))]
         fold_users[best].add(u)
         fold_cov[best].update(u_cov)
 
-    # 3) verify each fold reaches the minimum required classes; if not, try simple swaps
     def fold_ok(k: int) -> bool:
         return len([c for c in class_cols if (prof_ug.loc[prof_ug["user"].isin(list(fold_users[k])), c].sum() > 0)]) >= test_min_classes
 
     for k in range(folds):
         if fold_ok(k):
             continue
-        # try to swap a user with another fold to increase classes
-        need_class_set = set()
-        present = set([c for c in class_cols if (prof_ug.loc[prof_ug["user"].isin(list(fold_users[k])), c].sum() > 0)])
-        # we just need any extra class to reach the threshold
         for kk in range(folds):
             if k == kk: continue
+            swapped = False
             for u2 in list(fold_users[kk]):
                 u2_cov = set([c for c in class_cols if prof_ug.loc[prof_ug["user"]==u2, c].values[0] > 0])
-                if len(present | u2_cov) >= test_min_classes:
-                    # move u2 to k (swap with any user from k that doesn't break kk)
-                    for u1 in list(fold_users[k]):
-                        u1_cov = set([c for c in class_cols if prof_ug.loc[prof_ug["user"]==u1, c].values[0] > 0])
-                        # simulate swap
-                        new_k_users  = (fold_users[k]  - {u1}) | {u2}
-                        new_kk_users = (fold_users[kk] - {u2}) | {u1}
-                        def classes_of(us):
-                            sub = prof_ug[prof_ug["user"].isin(list(us))]
-                            return set([c for c in class_cols if sub[c].sum() > 0])
-                        if len(classes_of(new_k_users))  >= test_min_classes and \
-                           len(classes_of(new_kk_users)) >= test_min_classes:
-                            fold_users[k].remove(u1); fold_users[k].add(u2)
-                            fold_users[kk].remove(u2); fold_users[kk].add(u1)
-                            break
-                    break
-            if fold_ok(k): break
+                for u1 in list(fold_users[k]):
+                    u1_cov = set([c for c in class_cols if prof_ug.loc[prof_ug["user"]==u1, c].values[0] > 0])
+                    new_k_users  = (fold_users[k]  - {u1}) | {u2}
+                    new_kk_users = (fold_users[kk] - {u2}) | {u1}
+                    def classes_of(us):
+                        sub = prof_ug[prof_ug["user"].isin(list(us))]
+                        return set([c for c in class_cols if sub[c].sum() > 0])
+                    if len(classes_of(new_k_users))  >= test_min_classes and \
+                       len(classes_of(new_kk_users)) >= test_min_classes:
+                        fold_users[k].remove(u1); fold_users[k].add(u2)
+                        fold_users[kk].remove(u2); fold_users[kk].add(u1)
+                        swapped = True
+                        break
+                if swapped: break
         if not fold_ok(k):
             raise RuntimeError("Deterministic fold builder could not enforce class diversity. Reduce 'folds' or relax constraints.")
 
     return [np.array(sorted(list(s))) for s in fold_users]
 
-# ---------------------- transfer evaluation ----------------------
+# ---------------------- transfer evaluation (parallel tasks) ----------------------
 
-def run_transfer_II_pooled(
+def _eval_task(
+    te_users: np.ndarray,
+    df_src_pool: pd.DataFrame,
+    df_ug: pd.DataFrame,
+    feature_cols_intersection: List[str],
+    pipe_plm,  # pre-trained pooled PLM model
+    y_src_vec: np.ndarray,
+    y_ug: np.ndarray,
+    trained_classes_plm: np.ndarray,
+    full_labels: List[int],
+    multiclass: bool,
+    seed: int
+) -> Tuple[float, float]:
+    """
+    One (repeat, fold) evaluation task.
+    Returns (plm_auc, hm_auc).
+    """
+    rng = np.random.RandomState(seed)
+    ug_user_series = df_ug["userid"].astype(str)
+    te_idx = np.where(ug_user_series.isin(te_users))[0]
+
+    # ---------- PLM ----------
+    X_te = df_ug[feature_cols_intersection].iloc[te_idx]
+    y_te = y_ug[te_idx]
+    proba = pipe_plm.predict_proba(X_te)
+    proba = ensure_proba_columns(proba, trained_classes_plm, full_labels)
+    if multiclass:
+        plm_auc = roc_auc_score(y_te, proba, multi_class="ovr", average="macro", labels=full_labels)
+    else:
+        plm_auc = roc_auc_score(y_te, proba[:,1])
+
+    # ---------- HM ----------
+    hm_add = []
+    for u in te_users:
+        u_idx = np.where(ug_user_series.values == u)[0]
+        u_idx = np.intersect1d(u_idx, te_idx, assume_unique=False)
+        u_loc = u_idx.copy()
+        rng.shuffle(u_loc)
+        half = int(math.floor(len(u_loc) * 0.5))
+        hm_add.extend(u_loc[:half].tolist())
+    hm_add = np.array(sorted(hm_add))
+
+    X_hm_train = pd.concat([df_src_pool[feature_cols_intersection],
+                            df_ug[feature_cols_intersection].iloc[hm_add]], axis=0)
+    y_hm_train = np.concatenate([y_src_vec, y_ug[hm_add]], axis=0)
+
+    if len(y_hm_train) > len(y_src_vec):
+        keep_idx, _, _, _ = train_test_split(
+            np.arange(len(y_hm_train)), y_hm_train,
+            train_size=len(y_src_vec), stratify=y_hm_train,
+            random_state=int(rng.randint(0, 2**31-1))
+        )
+        X_hm_train = X_hm_train.iloc[keep_idx]
+        y_hm_train = y_hm_train[keep_idx]
+
+    # Train HM model (RF n_jobs=1; threads controlled by env)
+    model_maker = make_rf_pipeline  # RF primary
+    pipe_hm = model_maker()
+    pipe_hm.fit(X_hm_train, y_hm_train)
+    trained_classes_hm = pipe_hm.named_steps["clf"].classes_.astype(int)
+
+    # evaluate on remaining half
+    hm_te = []
+    for u in te_users:
+        u_idx = np.where(ug_user_series.values == u)[0]
+        u_idx = np.intersect1d(u_idx, te_idx, assume_unique=False)
+        rng.shuffle(u_idx)
+        half = int(math.floor(len(u_idx) * 0.5))
+        hm_te.extend(u_idx[half:].tolist())
+    hm_te = np.array(sorted(hm_te))
+
+    X_te_hm = df_ug[feature_cols_intersection].iloc[hm_te]
+    y_te_hm = y_ug[hm_te]
+    proba_hm = pipe_hm.predict_proba(X_te_hm)
+    proba_hm = ensure_proba_columns(proba_hm, trained_classes_hm, full_labels)
+    if multiclass:
+        hm_auc = roc_auc_score(y_te_hm, proba_hm, multi_class="ovr", average="macro", labels=full_labels)
+    else:
+        hm_auc = roc_auc_score(y_te_hm, proba_hm[:,1])
+
+    return float(plm_auc), float(hm_auc)
+
+def run_transfer_II_pooled_parallel(
     df_src_pool: pd.DataFrame, df_ug: pd.DataFrame,
     feature_cols_intersection: List[str],
-    model_maker,
     folds: int, repeats: int,
     multiclass: bool,
     rng_seed: int = 42
 ) -> Tuple[Tuple[float,float], Tuple[float,float]]:
     """
-    Train on pooled foreign source; evaluate on UG with user-folds (PLM) and HM (few-shot personalization).
-    Returns (PLM_mean±sd, HM_mean±sd) AUROC.
+    Parallel task runner: builds deterministic UG folds once, trains pooled PLM once,
+    then evaluates (repeat, fold) tasks in parallel using N_WORKERS.
     """
     rng = np.random.RandomState(rng_seed)
 
@@ -312,82 +394,43 @@ def run_transfer_II_pooled(
 
     # UG folds with deterministic, disjoint construction
     prof_ug = user_class_profile(y_ug, df_ug["userid"].values, classes_all)
-    ug_user_series = df_ug["userid"].astype(str)
     fold_user_sets = build_disjoint_folds_with_constraints(
         prof_ug, folds=folds, test_min_classes=test_min_classes, classes_all=classes_all
     )
 
-    # Train once on pooled source — PLM baseline
+    # Train pooled PLM model once (RF n_jobs=1)
     X_src = df_src_pool[feature_cols_intersection]; y_src_vec = y_src
-    pipe_plm = model_maker(); pipe_plm.fit(X_src, y_src_vec)
+    pipe_plm = make_rf_pipeline(); pipe_plm.fit(X_src, y_src_vec)
     trained_classes_plm = pipe_plm.named_steps["clf"].classes_.astype(int)
 
-    plm_scores, hm_scores = [], []
-
+    # Build task list: one per (repeat, fold)
+    tasks = []
     for rep in range(repeats):
-        # optional shuffle of the fold order per repeat
         order = np.arange(len(fold_user_sets)); rng.shuffle(order)
         for idx in order:
             te_users = fold_user_sets[idx]
-            te_idx = np.where(ug_user_series.isin(te_users))[0]
+            # seed per task so splits are independent/reproducible
+            seed = int(rng.randint(0, 2**31-1))
+            tasks.append((te_users, seed))
 
-            # ---------- PLM ----------
-            X_te = df_ug[feature_cols_intersection].iloc[te_idx]
-            y_te = y_ug[te_idx]
-            proba = pipe_plm.predict_proba(X_te)
-            proba = ensure_proba_columns(proba, trained_classes_plm, full_labels)
-            if multiclass:
-                auc = roc_auc_score(y_te, proba, multi_class="ovr", average="macro", labels=full_labels)
-            else:
-                auc = roc_auc_score(y_te, proba[:,1])
-            plm_scores.append(auc)
+    # Execute tasks in parallel
+    results = Parallel(n_jobs=N_WORKERS, backend="loky", prefer="processes")(
+        delayed(_eval_task)(
+            te_users,
+            df_src_pool, df_ug,
+            feature_cols_intersection,
+            pipe_plm,
+            y_src_vec, y_ug,
+            trained_classes_plm,
+            full_labels,
+            multiclass,
+            seed
+        )
+        for (te_users, seed) in tasks
+    )
 
-            # ---------- HM ----------
-            hm_add = []
-            for u in te_users:
-                u_idx = np.where(ug_user_series.values == u)[0]
-                u_idx = np.intersect1d(u_idx, te_idx, assume_unique=False)
-                u_loc = u_idx.copy()
-                rng.shuffle(u_loc)
-                half = int(math.floor(len(u_loc) * 0.5))
-                hm_add.extend(u_loc[:half].tolist())
-            hm_add = np.array(sorted(hm_add))
-
-            X_hm_train = pd.concat([df_src_pool[feature_cols_intersection],
-                                    df_ug[feature_cols_intersection].iloc[hm_add]], axis=0)
-            y_hm_train = np.concatenate([y_src_vec, y_ug[hm_add]], axis=0)
-
-            if len(y_hm_train) > len(y_src_vec):
-                keep_idx, _, _, _ = train_test_split(
-                    np.arange(len(y_hm_train)), y_hm_train,
-                    train_size=len(y_src_vec), stratify=y_hm_train,
-                    random_state=int(rng.randint(0, 2**31-1))
-                )
-                X_hm_train = X_hm_train.iloc[keep_idx]
-                y_hm_train = y_hm_train[keep_idx]
-
-            pipe_hm = model_maker(); pipe_hm.fit(X_hm_train, y_hm_train)
-            trained_classes_hm = pipe_hm.named_steps["clf"].classes_.astype(int)
-
-            # evaluate on remaining half
-            hm_te = []
-            for u in te_users:
-                u_idx = np.where(ug_user_series.values == u)[0]
-                u_idx = np.intersect1d(u_idx, te_idx, assume_unique=False)
-                rng.shuffle(u_idx)
-                half = int(math.floor(len(u_idx) * 0.5))
-                hm_te.extend(u_idx[half:].tolist())
-            hm_te = np.array(sorted(hm_te))
-
-            X_te_hm = df_ug[feature_cols_intersection].iloc[hm_te]
-            y_te_hm = y_ug[hm_te]
-            proba_hm = pipe_hm.predict_proba(X_te_hm)
-            proba_hm = ensure_proba_columns(proba_hm, trained_classes_hm, full_labels)
-            if multiclass:
-                auc_hm = roc_auc_score(y_te_hm, proba_hm, multi_class="ovr", average="macro", labels=full_labels)
-            else:
-                auc_hm = roc_auc_score(y_te_hm, proba_hm[:,1])
-            hm_scores.append(auc_hm)
+    plm_scores = [r[0] for r in results]
+    hm_scores  = [r[1] for r in results]
 
     return (float(np.mean(plm_scores)), float(np.std(plm_scores))), \
            (float(np.mean(hm_scores)),  float(np.std(hm_scores)))
@@ -432,27 +475,26 @@ def main():
     tolerance_minutes = 60
     folds = 2
     repeats = 5
-    model = "rf"
     target_country = "Uganda"
 
-    # Assemble all sites
-    print("=== Loading & aligning all sites ===")
-    frames = []
-    for s in sites:
-        print(f"--- Loading {s['site']} ({s['country']}/{s['continent']}) ---")
-        df = load_and_align_site(s["site"], s["country"], s["continent"],
-                                 s["features"], s["timediaries"],
-                                 tolerance_minutes)
-        print(f"    aligned={len(df)} users={df['userid'].nunique()} A6a={df['A6a'].value_counts(dropna=False).to_dict()}")
-        frames.append(df)
+    # ---------------- Parallel site loading ----------------
+    print(f"=== Loading & aligning all sites (parallel, n_jobs={N_WORKERS}) ===")
+    frames = Parallel(n_jobs=N_WORKERS, backend="loky", prefer="processes")(
+        delayed(_load_site_entry)(s, tolerance_minutes) for s in sites
+    )
+    for s, df in zip(sites, frames):
+        print(f"--- Loaded {s['site']} ({s['country']}/{s['continent']}) | "
+              f"aligned={len(df)} users={df['userid'].nunique()} A6a={df['A6a'].value_counts(dropna=False).to_dict()}")
+
     df_all = pd.concat(frames, ignore_index=True)
     print(f"Total rows={len(df_all)} users={df_all['userid'].nunique()} countries={df_all['country'].nunique()}")
 
     # Labels (single assign to avoid fragmentation warnings)
+    a6 = df_all["A6a"].astype("int64")
     df_all = df_all.assign(
-        valence5 = df_all["A6a"].astype("int64"),
-        y_bin    = map_binary(df_all["A6a"].astype("int64").values),
-        y_three  = map_three(df_all["A6a"].astype("int64").values),
+        valence5 = a6,
+        y_bin    = map_binary(a6.values),
+        y_three  = map_three(a6.values),
     )
 
     # Partition target vs pooled sources
@@ -473,18 +515,15 @@ def main():
         raise RuntimeError("No shared numeric features between pooled source and UG.")
     print(f"Using {len(feat_inter)} shared features.")
 
-    # Model factory
-    model_maker = make_rf_pipeline if model=="rf" else make_svc_pipeline
-
     results = {}
 
-    # Binary
+    # ---------------- Binary ----------------
     try:
-        print("\n=== Binary (neg vs non-neg) ===")
+        print("\n=== Binary (neg vs non-neg) — parallel evaluation ===")
         print("Pooled Source Binary counts:", class_counts(df_src_pool["y_bin"].values))
         print("Target Binary counts:", class_counts(df_ug["y_bin"].values))
-        (plm_bin_m, plm_bin_s), (hm_bin_m, hm_bin_s) = run_transfer_II_pooled(
-            df_src_pool, df_ug, feat_inter, model_maker,
+        (plm_bin_m, plm_bin_s), (hm_bin_m, hm_bin_s) = run_transfer_II_pooled_parallel(
+            df_src_pool, df_ug, feat_inter,
             folds=folds, repeats=repeats, multiclass=False
         )
         results["binary"] = {"plm": {"mean": plm_bin_m, "std": plm_bin_s},
@@ -495,13 +534,13 @@ def main():
         print(f"[ERROR] Binary (ALL-{target_country})→{target_country}: {e}")
         results["binary"] = {"error": str(e)}
 
-    # Three-class
+    # ---------------- Three-class ----------------
     try:
-        print("\n=== Three-class (neg/neutral/pos) ===")
+        print("\n=== Three-class (neg/neutral/pos) — parallel evaluation ===")
         print("Pooled Source Three-class counts:", class_counts(df_src_pool["y_three"].values))
         print("Target Three-class counts:", class_counts(df_ug["y_three"].values))
-        (plm_3_m, plm_3_s), (hm_3_m, hm_3_s) = run_transfer_II_pooled(
-            df_src_pool, df_ug, feat_inter, model_maker,
+        (plm_3_m, plm_3_s), (hm_3_m, hm_3_s) = run_transfer_II_pooled_parallel(
+            df_src_pool, df_ug, feat_inter,
             folds=folds, repeats=repeats, multiclass=True
         )
         results["three_class"] = {"plm": {"mean": plm_3_m, "std": plm_3_s},
