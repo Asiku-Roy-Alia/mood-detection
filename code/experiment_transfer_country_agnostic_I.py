@@ -359,8 +359,14 @@ def main():
          "timediaries": "../data/Timediaries/Mak/timediaries.parquet"},
         {"site": "Ulaanbaatar", "country": "Mongolia", "continent": "Asia",
          "features": "../data/new_data/Ulaanbaatar/processed/joined_features.csv",
-         "timediaries": "../data/Timediaries/Ulaanbataar/timediaries.parquet"}  
-    ]
+         "timediaries": "../data/Timediaries/Ulaanbataar/timediaries.parquet"},
+        {"site": "London", "country": "UnitedKingdom", "continent": "Europe",
+         "features": "../data/new_data/London/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/London/timediaries.parquet"},
+        {"site": "Trento", "country": "Italy", "continent": "Europe",
+         "features": "../data/new_data/Trento/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/Trento/timediaries.parquet"}
+    ] 
 
     outdir = "../results"
     os.makedirs(outdir, exist_ok=True)

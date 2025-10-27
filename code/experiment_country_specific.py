@@ -452,6 +452,12 @@ def main():
             "timediaries": "../data/Timediaries_new/Ulaanbataar/timediaries.xlsx",  
             "outdir": "../results"
         },
+        {
+            "site_name": "Mak (Uganda)",
+            "features": "../data/new_data/Mak/processed/joined_features.csv",
+            "timediaries": "../data/Timediaries/Mak/timediaries.parquet",
+            "outdir": "../results"
+        },
                 {
             "site_name": "London (United Kingdom)",
             "features": "../data/new_data/London/processed/joined_features.csv",
@@ -465,12 +471,6 @@ def main():
             "site_name": "LuisPotosi (Mexico)",
             "features": "../data/new_data/LuisPotosi/processed/joined_features.csv",
             "timediaries": "../data/Timediaries/LuisPotosi/timediaries.parquet",
-            "outdir": "../results"
-        },
-        {
-            "site_name": "Mak (Uganda)",
-            "features": "../data/new_data/Mak/processed/joined_features.csv",
-            "timediaries": "../data/Timediaries/Mak/timediaries.parquet",
             "outdir": "../results"
         },
         {

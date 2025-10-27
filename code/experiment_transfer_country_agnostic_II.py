@@ -2,7 +2,9 @@
 # Country-Agnostic II: Train on pooled foreign countries (ALL - UG), test on UG.
 # Outputs PLM (pure transfer) and HM (few-shot personalization) AUROC for Binary and Three-class.
 
-import argparse, os, math, json
+import os
+import math
+import json
 from typing import Optional, List, Tuple, Iterable, Dict
 import numpy as np
 import pandas as pd
@@ -61,7 +63,9 @@ def load_features(path: str) -> pd.DataFrame:
     if "start_interval" not in df.columns or "end_interval" not in df.columns:
         raise ValueError("Expected 'start_interval' and 'end_interval' in features.")
     df["start_interval"] = parse_dt(df["start_interval"])
+    df["start_interval"] = df["start_interval"].dt.tz_localize(None)
     df["end_interval"]   = parse_dt(df["end_interval"])
+    df["end_interval"] = df["end_interval"].dt.tz_localize(None)
     # bools -> ints for KNNImputer
     bool_cols = df.select_dtypes(include=['bool']).columns
     if len(bool_cols): df[bool_cols] = df[bool_cols].astype(int)
@@ -69,19 +73,23 @@ def load_features(path: str) -> pd.DataFrame:
 
 def load_timediaries(path: str, td_time_col: Optional[str], td_user_col: Optional[str],
                      feat_userids: pd.Series) -> pd.DataFrame:
-    if os.path.isdir(path):
-        parts = [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".parquet")]
-        if not parts: raise FileNotFoundError(f"No .parquet found in folder: {path}")
-        path = parts[0]
-    try:
-        td = pd.read_parquet(path)  # needs pyarrow or fastparquet
-    except Exception as e:
-        raise RuntimeError(f"Failed to read parquet: {e}\nInstall: pip install pyarrow  (or fastparquet)")
+    if path.endswith('.xlsx'):
+        td = pd.read_excel(path)
+    else:
+        if os.path.isdir(path):
+            parts = [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".parquet")]
+            if not parts: raise FileNotFoundError(f"No .parquet found in folder: {path}")
+            path = parts[0]
+        try:
+            td = pd.read_parquet(path)  # needs pyarrow or fastparquet
+        except Exception as e:
+            raise RuntimeError(f"Failed to read parquet: {e}\nInstall: pip install pyarrow  (or fastparquet)")
     if "A6a" not in td.columns: raise ValueError("Timediaries missing 'A6a' (mood).")
     time_col = td_time_col or pick_best_datetime_column(td)
     user_col = td_user_col or pick_user_id_column(td, feat_userids)
     td = td[[user_col, time_col, "A6a"]].rename(columns={user_col:"td_userid", time_col:"td_time"})
     td["td_time"] = parse_dt(td["td_time"])
+    td["td_time"] = td["td_time"].dt.tz_localize(None)
     td = td[td["A6a"].notna()].copy()
     td["td_userid"] = td["td_userid"].astype(str)
     return td
@@ -114,7 +122,7 @@ def align_features_with_mood(features: pd.DataFrame, td: pd.DataFrame,
 def load_and_align_site(site: str, country: str, continent: str,
                         feat_path: str, td_path: str,
                         tolerance_minutes: int,
-                        td_time_col: Optional[str], td_user_col: Optional[str]) -> pd.DataFrame:
+                        td_time_col: Optional[str]=None, td_user_col: Optional[str]=None) -> pd.DataFrame:
     feat = load_features(feat_path)
     td   = load_timediaries(td_path, td_time_col, td_user_col, feat["userid"])
     df   = align_features_with_mood(feat, td, tolerance_minutes)
@@ -125,28 +133,12 @@ def load_and_align_site(site: str, country: str, continent: str,
     df["userid"] = (df["site"].astype(str) + ":" + df["userid"].astype(str)).astype(str)
     return df
 
-def assemble_from_manifest(manifest_csv: str, tolerance_minutes: int,
-                           td_time_col: Optional[str], td_user_col: Optional[str]) -> pd.DataFrame:
-    man = pd.read_csv(manifest_csv)
-    req = {"site","country","continent","features_path","timediaries_path"}
-    miss = req - set(man.columns)
-    if miss: raise ValueError(f"Manifest missing columns: {miss}")
-    frames=[]
-    for _, r in man.iterrows():
-        print(f"--- Loading {r['site']} ({r['country']}/{r['continent']}) ---")
-        df = load_and_align_site(str(r["site"]), str(r["country"]), str(r["continent"]),
-                                 str(r["features_path"]), str(r["timediaries_path"]),
-                                 tolerance_minutes, td_time_col, td_user_col)
-        print(f"    aligned={len(df)} users={df['userid'].nunique()} A6a={df['A6a'].value_counts(dropna=False).to_dict()}")
-        frames.append(df)
-    return pd.concat(frames, ignore_index=True)
-
 # ------------------------ models & helpers ------------------------
 
 def make_rf_pipeline(k_impute=5):
     return Pipeline([
         ("impute", KNNImputer(n_neighbors=k_impute)),
-        ("clf", RandomForestClassifier(n_estimators=200, random_state=42, class_weight="balanced"))
+        ("clf", RandomForestClassifier(n_estimators=100, random_state=42, class_weight="balanced"))  # Reduced for speed
     ])
 
 def make_svc_pipeline(k_impute=5):
@@ -159,21 +151,25 @@ def make_svc_pipeline(k_impute=5):
 def ensure_proba_columns(y_score: np.ndarray, trained_classes: np.ndarray, full_labels: List[int]) -> np.ndarray:
     """
     Re-map predict_proba outputs to fixed column order (full_labels).
-    If a class is absent in training, fill its column with zeros; renormalize if needed.
+    If a class is absent in training, fill its column with zeros.
     """
     trained_classes = np.asarray(trained_classes).astype(int)
     idx_map = {c:i for i,c in enumerate(trained_classes)}
     out = np.zeros((y_score.shape[0], len(full_labels)), dtype=float)
     for j, c in enumerate(full_labels):
-        if c in idx_map: out[:, j] = y_score[:, idx_map[c]]
-        else:            out[:, j] = 0.0
+        if c in idx_map:
+            out[:, j] = y_score[:, idx_map[c]]
+        else:
+            out[:, j] = 0.0
+    # Re-normalize row-wise to avoid degenerate zeros-only vectors
     rowsum = out.sum(axis=1, keepdims=True)
     zero_rows = rowsum.squeeze() == 0
     if np.any(zero_rows):
+        # fallback to uniform for missing all-trained-classes edge case (shouldn't happen if model trained on >=2 classes)
         out[zero_rows] = 1.0 / len(full_labels)
     return out
 
-# ---------------------- UG fold builder ----------------------
+# ---------------------- transfer evaluation ----------------------
 
 def user_class_profile(y: np.ndarray, users: np.ndarray, classes: Iterable[int]) -> pd.DataFrame:
     df = pd.DataFrame({"user": users, "y": y})
@@ -193,8 +189,11 @@ def sample_ug_test_users(prof_ug: pd.DataFrame, folds: int, rng: np.random.Rando
     n_test = max(1, int(round(n_users / folds)))
     class_cols = [c for c in prof_ug.columns if isinstance(c, (int, np.integer))]
 
-    folds_sets, tried = [], set()
-    while len(folds_sets) < folds and len(tried) < 5000:
+    folds_sets = []
+    tried = set()
+    max_tries = 1000  # Reduced for speed
+
+    while len(folds_sets) < folds and len(tried) < max_tries:
         te_users = rng.choice(users, size=n_test, replace=False)
         key = tuple(sorted(te_users.tolist()))
         if key in tried: 
@@ -202,13 +201,13 @@ def sample_ug_test_users(prof_ug: pd.DataFrame, folds: int, rng: np.random.Rando
         tried.add(key)
         te_mask = prof_ug["user"].isin(te_users)
         te_present = [c for c in class_cols if prof_ug.loc[te_mask, c].sum() > 0]
-        if len(te_present) >= test_min_classes and not any(len(set(te_users) & set(prev))>0 for prev in folds_sets):
-            folds_sets.append(te_users)
+        if len(te_present) >= test_min_classes:
+            # ensure disjointness among folds
+            if not any(len(set(te_users) & set(prev)) > 0 for prev in folds_sets):
+                folds_sets.append(te_users)
     if len(folds_sets) < folds:
         raise RuntimeError("Unable to construct disjoint UG test user folds with required class diversity.")
     return folds_sets
-
-# ---------------------- transfer evaluation ----------------------
 
 def run_transfer_II_pooled(
     df_src_pool: pd.DataFrame, df_ug: pd.DataFrame,
@@ -238,7 +237,7 @@ def run_transfer_II_pooled(
         test_min_classes = 2
         full_labels = [0,1]
 
-    # Must have >=2 classes in the pooled source to train a classifier
+    # Ensure pooled source has at least 2 classes to train a classifier
     if len(np.unique(y_src)) < 2:
         raise RuntimeError("Pooled source has <2 classes for this task; cannot train a classifier.")
 
@@ -282,15 +281,13 @@ def run_transfer_II_pooled(
             hm_add = np.array(sorted(hm_add))
 
             # HM training = pooled source + few-shot UG; then stratified downsample to original source size
-            X_hm_train = pd.concat([df_src_pool[feature_cols_intersection],
-                                    df_ug[feature_cols_intersection].iloc[hm_add]], axis=0)
-            y_hm_train = np.concatenate([y_src_vec, y_ug[hm_add]], axis=0)
+            X_hm_train = pd.concat([df_src_pool[feature_cols_intersection], df_ug[feature_cols_intersection].iloc[hm_add]], axis=0)
+            y_hm_train = np.concatenate([y_src, y_ug[hm_add]], axis=0)
 
-            if len(y_hm_train) > len(y_src_vec):
+            if len(y_hm_train) > len(y_src):
                 keep_idx, _, _, _ = train_test_split(
                     np.arange(len(y_hm_train)), y_hm_train,
-                    train_size=len(y_src_vec), stratify=y_hm_train,
-                    random_state=rng
+                    train_size=len(y_src), stratify=y_hm_train, random_state=int(rng.randint(0, 2**31-1))
                 )
                 X_hm_train = X_hm_train.iloc[keep_idx]
                 y_hm_train = y_hm_train[keep_idx]
@@ -324,24 +321,58 @@ def run_transfer_II_pooled(
 # ----------------------------- main -----------------------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", required=True, help="CSV: site,country,continent,features_path,timediaries_path")
-    ap.add_argument("--target_country", required=True, help="Country code for target (e.g., UG)")
-    ap.add_argument("--td_time_col", default=None, help="Override timediaries time col (optional)")
-    ap.add_argument("--td_user_col", default=None, help="Override timediaries user col (optional)")
-    ap.add_argument("--tolerance_minutes", type=int, default=60)
-    ap.add_argument("--folds", type=int, default=5)
-    ap.add_argument("--repeats", type=int, default=5)
-    ap.add_argument("--model", choices=["rf","svc"], default="rf")
-    ap.add_argument("--outdir", default="./results/transfer_II")
-    args = ap.parse_args()
+    # Sites 
+    sites = [
+        {"site": "LuisPotosi", "country": "Mexico", "continent": "Latin America",
+         "features": "../data/new_data/LuisPotosi/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/LuisPotosi/timediaries.parquet"},
+        {"site": "Amrita", "country": "India", "continent": "Asia",
+         "features": "../data/new_data/Amrita/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/Amrita/timediaries.parquet"},
+        {"site": "Asuncion", "country": "Paraguay", "continent": "Latin America",
+         "features": "../data/new_data/Asuncion/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/Asuncion/timediaries.parquet"},
+        {"site": "Copenhagen", "country": "Denmark", "continent": "Europe",
+         "features": "../data/new_data/Copenhagen/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/Copenhagen/timediaries.parquet"},
+        {"site": "Jilin", "country": "China", "continent": "Asia",
+         "features": "../data/new_data/Jilin/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/Jilin/timediaries.parquet"},
+        {"site": "Ulaanbaatar", "country": "Mongolia", "continent": "Asia",
+         "features": "../data/new_data/Ulaanbaatar/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/Ulaanbataar/timediaries.parquet"},
+        {"site": "Mak", "country": "Uganda", "continent": "Africa",
+         "features": "../data/new_data/Mak/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/Mak/timediaries.parquet"},
+        {"site": "London", "country": "UnitedKingdom", "continent": "Europe",
+         "features": "../data/new_data/London/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/London/timediaries.parquet"},
+        {"site": "Trento", "country": "Italy", "continent": "Europe",
+         "features": "../data/new_data/Trento/processed/joined_features.csv",
+         "timediaries": "../data/Timediaries/Trento/timediaries.parquet"}
+    ]
 
-    os.makedirs(args.outdir, exist_ok=True)
+    outdir = "../results"
+    os.makedirs(outdir, exist_ok=True)
+
+    tolerance_minutes = 60
+    folds = 3  # For speed
+    repeats = 5
+    model = "rf"
+    target_country = "Uganda"
 
     # Assemble all sites
-    print("=== Loading & aligning all sites from manifest ===")
-    df_all = assemble_from_manifest(args.manifest, args.tolerance_minutes, args.td_time_col, args.td_user_col)
-    print(f"Rows={len(df_all)} Users={df_all['userid'].nunique()} Countries={df_all['country'].nunique()}")
+    print("=== Loading & aligning all sites ===")
+    frames = []
+    for s in sites:
+        print(f"--- Loading {s['site']} ({s['country']}/{s['continent']}) ---")
+        df = load_and_align_site(s["site"], s["country"], s["continent"],
+                                 s["features"], s["timediaries"],
+                                 tolerance_minutes)
+        print(f"    aligned={len(df)} users={df['userid'].nunique()} A6a={df['A6a'].value_counts(dropna=False).to_dict()}")
+        frames.append(df)
+    df_all = pd.concat(frames, ignore_index=True)
+    print(f"Total rows={len(df_all)} users={df_all['userid'].nunique()} countries={df_all['country'].nunique()}")
 
     # Labels
     df_all["valence5"] = df_all["A6a"].astype("int64")
@@ -349,13 +380,13 @@ def main():
     df_all["y_three"]  = map_three(df_all["valence5"].values)
 
     # Partition target vs pooled sources
-    target_mask = df_all["country"].astype(str).str.upper() == args.target_country.upper()
+    target_mask = df_all["country"].astype(str).str.upper() == target_country.upper()
     if not target_mask.any():
-        raise ValueError(f"Target country {args.target_country} not found in manifest data.")
+        raise ValueError(f"Target country {target_country} not found in data.")
     df_ug = df_all[target_mask].copy()
     df_src_pool = df_all[~target_mask].copy()
 
-    # Intersect numeric feature space (robust across sites)
+    # Feature-space harmonization: only use numeric features common to all
     key_cols = {"userid","experimentid","start_interval","end_interval","A6a","td_time",
                 "valence5","y_bin","y_three","site","country","continent"}
     numeric_cols = [c for c in df_all.columns if c not in key_cols and pd.api.types.is_numeric_dtype(df_all[c])]
@@ -364,42 +395,52 @@ def main():
     feat_inter = sorted(list(set(feat_src).intersection(set(feat_tgt))))
     if len(feat_inter) == 0:
         raise RuntimeError("No shared numeric features between pooled source and UG.")
-    print(f"Using {len(feat_inter)} shared numeric features.")
+    print(f"Using {len(feat_inter)} shared features.")
 
     # Model factory
-    model_maker = make_rf_pipeline if args.model=="rf" else make_svc_pipeline
+    model_maker = make_rf_pipeline if model=="rf" else make_svc_pipeline
 
     results = {}
 
-    # ---------- Binary ----------
+    # Binary
     try:
+        print("\n=== Binary (neg vs non-neg) ===")
+        print("Pooled Source Binary counts:", class_counts(df_src_pool["y_bin"].values))
+        print("Target Binary counts:", class_counts(df_ug["y_bin"].values))
         (plm_bin_m, plm_bin_s), (hm_bin_m, hm_bin_s) = run_transfer_II_pooled(
             df_src_pool, df_ug, feat_inter, model_maker,
-            folds=args.folds, repeats=args.repeats, multiclass=False
+            folds=folds, repeats=repeats, multiclass=False
         )
         results["binary"] = {"plm": {"mean": plm_bin_m, "std": plm_bin_s},
                              "hm":  {"mean": hm_bin_m,  "std": hm_bin_s}}
+        print(f"PLM AUROC: {plm_bin_m:.3f} ± {plm_bin_s:.3f}")
+        print(f"HM AUROC: {hm_bin_m:.3f} ± {hm_bin_s:.3f}")
     except Exception as e:
-        print(f"[ERROR] Binary (ALL-UG)→UG: {e}")
+        print(f"[ERROR] Binary (ALL-{target_country})→{target_country}: {e}")
         results["binary"] = {"error": str(e)}
 
-    # ---------- Three-class ----------
+    # Three-class
     try:
+        print("\n=== Three-class (neg/neutral/pos) ===")
+        print("Pooled Source Three-class counts:", class_counts(df_src_pool["y_three"].values))
+        print("Target Three-class counts:", class_counts(df_ug["y_three"].values))
         (plm_3_m, plm_3_s), (hm_3_m, hm_3_s) = run_transfer_II_pooled(
             df_src_pool, df_ug, feat_inter, model_maker,
-            folds=args.folds, repeats=args.repeats, multiclass=True
+            folds=folds, repeats=repeats, multiclass=True
         )
         results["three_class"] = {"plm": {"mean": plm_3_m, "std": plm_3_s},
                                   "hm":  {"mean": hm_3_m,  "std": hm_3_s}}
+        print(f"PLM macro-AUROC: {plm_3_m:.3f} ± {plm_3_s:.3f}")
+        print(f"HM macro-AUROC: {hm_3_m:.3f} ± {hm_3_s:.3f}")
     except Exception as e:
-        print(f"[ERROR] Three-class (ALL-UG)→UG: {e}")
+        print(f"[ERROR] Three-class (ALL-{target_country})→{target_country}: {e}")
         results["three_class"] = {"error": str(e)}
 
     # Save results
-    out_path = os.path.join(args.outdir, f"transfer_II_ALL_except_{args.target_country}_to_{args.target_country}.json")
+    out_path = os.path.join(outdir, f"transfer_II_ALL_except_{target_country.lower().replace(' ', '_')}_to_{target_country}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved results → {out_path}")
 
 if __name__ == "__main__":
-    main()
+    main() 
